@@ -1,0 +1,5 @@
+opencv-python==4.10.0.84
+ultralytics
+deepface
+tf-keras
+flask
