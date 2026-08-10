@@ -1,6 +1,4 @@
 opencv-python==4.10.0.84
 flask
 ultralytics
-deepface
-tf-keras
 lap>=0.5.12
