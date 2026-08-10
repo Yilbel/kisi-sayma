@@ -1,11 +1,24 @@
+import faulthandler
 import os
+import sys
+import time
 import cv2
 import csv
+import traceback
+import numpy as np
 from datetime import datetime
 from flask import Flask, Response
+
+os.environ.setdefault('TORCHDYNAMO_DISABLE', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+
 from ultralytics import YOLO
-from deepface import DeepFace
 import threading
+
+DeepFace = None
+
+faulthandler.enable(all_threads=True)
 
 # ==========================================================
 # TABLET VE DROIDCAM AYARLARI
@@ -29,9 +42,54 @@ else:
         print(f"[BILGI] {MODEL_PATH} yuklenemedi: {e}. Uzak model indiriliyor...")
         model = YOLO("yolov8n")
 
-cap = cv2.VideoCapture(DROIDCAM_URL)
 
-if not cap.isOpened():
+def warmup_yolo_model():
+    try:
+        print("[BILGI] YOLO model hazirlik islemleri yapiliyor...")
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        _ = model.predict(dummy_frame, classes=[0], verbose=False)
+        print("[BILGI] YOLO model hazirligi tamamlandi.")
+    except Exception as e:
+        print(f"[UYARI] YOLO model hazirligi sirasinda hata: {e}")
+        traceback.print_exc()
+
+
+def open_droidcam_stream(url, attempts=5, delay=2):
+    backends = [None]
+    if hasattr(cv2, 'CAP_FFMPEG'):
+        backends.append(cv2.CAP_FFMPEG)
+    for attempt in range(1, attempts + 1):
+        for backend in backends:
+            backend_name = 'default' if backend is None else 'FFMPEG'
+            print(f"[BILGI] DroidCam stream baglanti denemesi {attempt}/{attempts} ({backend_name}): {url}")
+            cap = cv2.VideoCapture(url) if backend is None else cv2.VideoCapture(url, backend)
+            if cap.isOpened():
+                print(f"[BILGI] DroidCam stream baglanti basarili ({backend_name}).")
+                return cap
+            cap.release()
+            print(f"[UYARI] {backend_name} backend ile DroidCam stream acilamadi.")
+        print(f"[UYARI] Tüm backendler başarısız oldu, {delay} saniye sonra tekrar denenecek.")
+        time.sleep(delay)
+    return None
+
+
+def reopen_droidcam_stream():
+    global cap
+    print("[BILGI] DroidCam baglantisi yeniden kuruluyor...")
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    cap = open_droidcam_stream(DROIDCAM_URL)
+    if cap is not None and cap.isOpened():
+        return True
+    print("[UYARI] DroidCam baglantisi yeniden kurulamadı.")
+    return False
+
+cap = None
+
+if not reopen_droidcam_stream():
     print("[HATA] Tablete baglanilamadi! Bilgisayar kamerasina geciliyor...")
     cap = cv2.VideoCapture(0)
 
@@ -50,7 +108,9 @@ MIN_KUTU_BOYUTU = 60
 gecis_kayitlari = []
 
 son_frame = None
+raw_frame = None
 frame_kilidi = threading.Lock()
+raw_frame_kilidi = threading.Lock()
 
 
 def yas_grubuna_cevir(yas):
@@ -65,6 +125,16 @@ def yas_grubuna_cevir(yas):
 
 
 def yas_tahmin_et(frame, box, track_id=None):
+    global DeepFace
+    if DeepFace is None:
+        try:
+            from deepface import DeepFace as _DeepFace
+            DeepFace = _DeepFace
+        except Exception as e:
+            print(f"[HATA] DeepFace import sirasinda hata: {e}")
+            traceback.print_exc()
+            return None
+
     x1, y1, x2, y2 = [max(0, int(v)) for v in box]
     kirpilmis = frame[y1:y2, x1:x2]
 
@@ -88,28 +158,106 @@ def yas_tahmin_et(frame, box, track_id=None):
         return yas_grubuna_cevir(yas)
     except Exception as e:
         print(f"[YAS TAHMIN HATASI - ID {track_id} icin]: {e}")
+        traceback.print_exc()
         return None
 
 
 CIZGI_X = 320
 
 
+def capture_thread():
+    global cap, raw_frame
+    print("[BILGI] capture_thread basladi.")
+    while True:
+        try:
+            if cap is None or not getattr(cap, 'isOpened', lambda: False)():
+                if not reopen_droidcam_stream():
+                    time.sleep(2)
+                    continue
+
+            ret, frame = cap.read()
+        except Exception as e:
+            print(f"[HATA] capture_thread cap.read() sirasinda istisna: {e}")
+            traceback.print_exc()
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = None
+            time.sleep(2)
+            continue
+
+        if not ret or frame is None:
+            print("[UYARI] Kare okunamadi veya frame None. DroidCam baglantisi yeniden deneniyor...")
+            if reopen_droidcam_stream():
+                continue
+            time.sleep(2)
+            continue
+
+        try:
+            with raw_frame_kilidi:
+                raw_frame = frame.copy()
+        except Exception as e:
+            print(f"[HATA] capture_thread frame.copy() sirasinda istisna: {e}")
+            traceback.print_exc()
+            time.sleep(0.1)
+            continue
+
+        time.sleep(0.01)
+
+
 def kamera_dongusu():
     global giris_sayisi, cikis_sayisi, KARE_SAYAC, son_frame
+    print("[BILGI] kamera_dongusu thread basladi.")
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Goruntu alinamadi. Program kapaniyor...")
-            break
+        try:
+            with raw_frame_kilidi:
+                frame = None if raw_frame is None else raw_frame.copy()
 
-        frame = cv2.resize(frame, (640, 480))
-        KARE_SAYAC += 1
+            if frame is None:
+                time.sleep(0.1)
+                continue
 
-        results = model.track(frame, classes=[0], persist=True, verbose=False)
-        annotated_frame = results[0].plot(labels=False, conf=False)
+            try:
+                frame = cv2.resize(frame, (640, 480))
+            except Exception as e:
+                print(f"[HATA] Kare boyutlandirma sirasinda hata: {e}. Yeniden denenecek.")
+                traceback.print_exc()
+                time.sleep(1)
+                continue
 
-        cv2.line(annotated_frame, (CIZGI_X, 0), (CIZGI_X, annotated_frame.shape[0]), (0, 0, 255), 2)
+            if frame is None:
+                time.sleep(0.1)
+                continue
+
+            with frame_kilidi:
+                son_frame = frame.copy()
+
+            KARE_SAYAC += 1
+        except Exception as e:
+            print(f"[HATA] kamera_dongusu ana dongu istisnasi: {e}")
+            traceback.print_exc()
+            time.sleep(1)
+            continue
+
+        try:
+            print(f"[BILGI] YOLO tahminine hazirlaniliyor. KARE_SAYAC={KARE_SAYAC}")
+            results = model.track(frame, classes=[0], persist=True, verbose=False)
+            annotated_frame = results[0].plot(labels=False, conf=False)
+            print("[BILGI] YOLO tahmini basarili.")
+        except Exception as e:
+            print(f"[HATA] YOLO tahmini sirasinda istisna: {e}")
+            traceback.print_exc()
+            continue
+
+        try:
+            cv2.line(annotated_frame, (CIZGI_X, 0), (CIZGI_X, annotated_frame.shape[0]), (0, 0, 255), 2)
+        except Exception as e:
+            print(f"[HATA] annotate islemi sirasinda istisna: {e}")
+            traceback.print_exc()
+            continue
 
         if results[0].boxes.id is not None:
             ids = results[0].boxes.id.int().tolist()
@@ -191,11 +339,17 @@ def frame_uret():
     while True:
         with frame_kilidi:
             if son_frame is None:
-                continue
-            basarili, buffer = cv2.imencode('.jpg', son_frame)
-            if not basarili:
-                continue
-            frame_bytes = buffer.tobytes()
+                frame_bytes = None
+            else:
+                basarili, buffer = cv2.imencode('.jpg', son_frame)
+                if basarili:
+                    frame_bytes = buffer.tobytes()
+                else:
+                    frame_bytes = None
+
+        if frame_bytes is None:
+            time.sleep(0.05)
+            continue
 
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
@@ -221,6 +375,11 @@ def anasayfa():
 
 
 if __name__ == '__main__':
+    warmup_yolo_model()
+
+    capture_thread_inst = threading.Thread(target=capture_thread, daemon=True)
+    capture_thread_inst.start()
+
     kamera_thread = threading.Thread(target=kamera_dongusu, daemon=True)
     kamera_thread.start()
 

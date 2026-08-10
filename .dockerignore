@@ -2,4 +2,8 @@
 debug_kirpilmis_*.jpg
 __pycache__/
 *.pyc
+yolov8n.pt
+test.py
+.venv/
+venv/
 .git/
