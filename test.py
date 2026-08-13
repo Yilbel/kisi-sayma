@@ -29,13 +29,21 @@ FLASK_PORT = 5000
 # ============================================================
 # KAPI / ÇİZGİ SAYIM AYARLARI
 # ============================================================
+# Çizgi artık sabit yatay değil, admin panelinden iki nokta (p1, p2)
+# olarak tanımlanıyor. HISTEREZIS_PAY artık çizgiye dik mesafe olarak,
+# KENAR_PAY ise çizgi boyunca (uçlara yakın "ölü alan") olarak
+# kullanılıyor -- yani ikisi de çizgiyle birlikte hareket ediyor.
 
-CIZGI_Y = 630
 HISTEREZIS_PAY = 30
 GECIS_ONAY_KARESI = 4
 MIN_SAYIM_KUTU_YUKSEKLIGI = 90
 KENAR_PAY = 15
 TRACK_KAYIP_SURESI = 45
+
+# Varsayılan çizgi: önceki çalışan sürümdeki CIZGI_Y=630 ile aynı konum
+cizgi_p1 = [0.0, 630.0]
+cizgi_p2 = [float(FRAME_W), 630.0]
+cizgi_kilidi = threading.Lock()
 
 
 # ============================================================
@@ -86,23 +94,16 @@ son_kutu_kilidi = threading.Lock()
 
 track_son_gorulme = {}
 
-# Aynı anda tek bir kare işlensin diye (paylaşılan global durumları
-# birden fazla istek aynı anda değiştirmesin).
+# Aynı anda tek bir kare işlensin diye.
 isleme_kilidi = threading.Lock()
 
 # ------------------------------------------------------------
 # CANLI YAYIN DEPOSU
 # ------------------------------------------------------------
-# "Bu Aygıtın Kamerasını Kullan" ile bağlanan cihaz (örn. akıllı tahta)
-# her işlenmiş kareyi buraya yazar. "Sunucuya Bağlan" ile bağlanan
-# diğer cihazlar (örn. telefon) sadece burayı okuyup ekranda gösterir,
-# kendi kameralarını kullanmazlar.
-son_yayin_karesi = None          # data:image/jpeg;base64,... formatında
-son_yayin_zamani = 0.0           # bu karenin geldiği zaman (time.time())
+son_yayin_karesi = None
+son_yayin_zamani = 0.0
 yayin_kilidi = threading.Lock()
 
-# Yayın "canlı" sayılsın diye: bu süreden uzun süredir yeni kare
-# gelmediyse izleyiciye "yayın yok" bilgisi verilir.
 YAYIN_ZAMAN_ASIMI = 5.0
 
 
@@ -135,8 +136,8 @@ except Exception as e:
 
 def yas_bandini_gruba_cevir(bant):
     cocuk = {"0-2", "3-9"}
-    genc = {"9-19", "20-36"}
-    yetiskin = {"36-39", "40-49", "50-59", "60-69", "70+"}
+    genc = {"10-19", "20-29"}
+    yetiskin = {"30-39", "40-49", "50-59", "60-69", "70+"}
     if bant in cocuk:
         return "Cocuk"
     if bant in genc:
@@ -258,17 +259,48 @@ def klavye_dinleyici():
 
 
 # ============================================================
-# YÖN VE GEÇİŞ İŞLEMLERİ
+# ÇİZGİ GEOMETRİSİ (iki nokta -> yön, normal, uzunluk)
 # ============================================================
 
-def ayak_konumundan_bolge_bul(ayak_y):
-    ust_sinir = CIZGI_Y - HISTEREZIS_PAY
-    alt_sinir = CIZGI_Y + HISTEREZIS_PAY
-    if ayak_y < ust_sinir:
-        return "yukari"
-    if ayak_y > alt_sinir:
-        return "asagi"
+def cizgi_parametreleri():
+    """Şu anki çizgiden (p1,p2) yön vektörü, normal vektör ve uzunluk üretir.
+    Çizgi dejenere (iki nokta aynı) ise varsayılan yatay çizgiye döner."""
+    with cizgi_kilidi:
+        x1, y1 = cizgi_p1
+        x2, y2 = cizgi_p2
+
+    dx, dy = x2 - x1, y2 - y1
+    uzunluk = (dx ** 2 + dy ** 2) ** 0.5
+
+    if uzunluk < 1e-6:
+        x1, y1 = 0.0, FRAME_H * 0.6
+        x2, y2 = float(FRAME_W), FRAME_H * 0.6
+        dx, dy = x2 - x1, y2 - y1
+        uzunluk = (dx ** 2 + dy ** 2) ** 0.5
+
+    ux, uy = dx / uzunluk, dy / uzunluk
+    nx, ny = -uy, ux  # normal (çizgiye dik) birim vektör
+
+    return x1, y1, x2, y2, ux, uy, nx, ny, uzunluk
+
+
+def nokta_taraf_bul(px, py, params):
+    x1, y1, x2, y2, ux, uy, nx, ny, uzunluk = params
+    isaretli_mesafe = (px - x1) * nx + (py - y1) * ny
+    if isaretli_mesafe < -HISTEREZIS_PAY:
+        return "A"
+    if isaretli_mesafe > HISTEREZIS_PAY:
+        return "B"
     return None
+
+
+def nokta_cizgi_uzerinde_mi(px, py, params):
+    """Nokta, çizginin iki ucundaki 'ölü alan' payı hariç, çizginin
+    kapsadığı aralık içinde mi? (Ölü alan çizgiyle birlikte hareket eder.)"""
+    x1, y1, x2, y2, ux, uy, nx, ny, uzunluk = params
+    t = ((px - x1) * ux + (py - y1) * uy) / uzunluk
+    kenar_pay_t = KENAR_PAY / uzunluk
+    return kenar_pay_t <= t <= (1 - kenar_pay_t)
 
 
 def gecisi_kaydet(track_id, yon, boy_m):
@@ -321,7 +353,7 @@ def eski_trackleri_temizle():
 
 
 # ============================================================
-# TEK KARE İŞLEME (tarayıcıdan gelen her kare burada işlenir)
+# TEK KARE İŞLEME
 # ============================================================
 
 def kareyi_isle(frame):
@@ -331,19 +363,26 @@ def kareyi_isle(frame):
     annotated_frame = frame.copy()
 
     with isleme_kilidi:
-
-         KARE_SAYAC += 1
+        KARE_SAYAC += 1
         kare_sayac_simdi = KARE_SAYAC
 
-        cv2.line(annotated_frame, (0, CIZGI_Y), (FRAME_W, CIZGI_Y), (0, 0, 255), 3)
-        cv2.line(annotated_frame, (0, CIZGI_Y - HISTEREZIS_PAY), (FRAME_W, CIZGI_Y - HISTEREZIS_PAY), (0, 255, 255), 1)
-        cv2.line(annotated_frame, (0, CIZGI_Y + HISTEREZIS_PAY), (FRAME_W, CIZGI_Y + HISTEREZIS_PAY), (0, 255, 255), 1)
-    
-        
+        params = cizgi_parametreleri()
+        x1, y1, x2, y2, ux, uy, nx, ny, uzunluk = params
+
+        # Ana çizgi
+        cv2.line(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+        # Histerezis paralel çizgileri (ana çizgiye dik yönde kaydırılmış)
+        p1a = (int(x1 + nx * HISTEREZIS_PAY), int(y1 + ny * HISTEREZIS_PAY))
+        p2a = (int(x2 + nx * HISTEREZIS_PAY), int(y2 + ny * HISTEREZIS_PAY))
+        p1b = (int(x1 - nx * HISTEREZIS_PAY), int(y1 - ny * HISTEREZIS_PAY))
+        p2b = (int(x2 - nx * HISTEREZIS_PAY), int(y2 - ny * HISTEREZIS_PAY))
+        cv2.line(annotated_frame, p1a, p2a, (0, 255, 255), 1)
+        cv2.line(annotated_frame, p1b, p2b, (0, 255, 255), 1)
+
         try:
             results = model.track(
                 frame, classes=[0], persist=True, tracker=BYTETRACK_CFG,
-                verbose=False, conf=0.35, iou=0.5
+                verbose=False, conf=0.25, iou=0.5
             )
         except Exception:
             return annotated_frame
@@ -356,23 +395,23 @@ def kareyi_isle(frame):
             boxes = result.boxes.xyxy.cpu().tolist()
 
             for track_id, box in zip(ids, boxes):
-                x1, y1, x2, y2 = [int(v) for v in box]
-                x1 = max(0, min(FRAME_W - 1, x1))
-                y1 = max(0, min(FRAME_H - 1, y1))
-                x2 = max(0, min(FRAME_W - 1, x2))
-                y2 = max(0, min(FRAME_H - 1, y2))
+                bx1, by1, bx2, by2 = [int(v) for v in box]
+                bx1 = max(0, min(FRAME_W - 1, bx1))
+                by1 = max(0, min(FRAME_H - 1, by1))
+                bx2 = max(0, min(FRAME_W - 1, bx2))
+                by2 = max(0, min(FRAME_H - 1, by2))
 
-                kutu_w, kutu_h = x2 - x1, y2 - y1
+                kutu_w, kutu_h = bx2 - bx1, by2 - by1
                 if kutu_w <= 0 or kutu_h <= 0:
                     continue
 
                 track_son_gorulme[track_id] = time.time()
                 guncel_yukseklikler[track_id] = kutu_h
 
-                ayak_x, ayak_y = int((x1 + x2) / 2), y2
+                ayak_x, ayak_y = int((bx1 + bx2) / 2), by2
 
                 cv2.circle(annotated_frame, (ayak_x, ayak_y), 6, (255, 0, 255), -1)
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
 
                 # Yaş / Cinsiyet Tahmini
                 if track_id not in kisi_bilgisi:
@@ -383,7 +422,7 @@ def kareyi_isle(frame):
                         and kutu_w >= MIN_KUTU_BOYUTU
                         and kutu_h >= MIN_KUTU_BOYUTU
                     ):
-                        yg, cins = yas_cinsiyet_tahmin_et(frame, (x1, y1, x2, y2), track_id)
+                        yg, cins = yas_cinsiyet_tahmin_et(frame, (bx1, by1, bx2, by2), track_id)
                         deneme_sayisi[track_id] += 1
                         if yg and cins:
                             kisi_bilgisi[track_id] = {"yas_grubu": yg, "cinsiyet": cins}
@@ -396,21 +435,31 @@ def kareyi_isle(frame):
                     if is_calibrated and pixels_per_meter > 0:
                         kisi_boyu_m = kutu_h / pixels_per_meter
 
-                # Sayım Kontrolü
+                # Sayım Kontrolü (çizgiye göre, ölü alan çizgiyle birlikte hareket eder)
+                cizgi_ici_mi = nokta_cizgi_uzerinde_mi(ayak_x, ayak_y, params)
                 guvenilir = (
                     kutu_h >= MIN_SAYIM_KUTU_YUKSEKLIGI
-                    and x1 > KENAR_PAY
-                    and x2 < FRAME_W - KENAR_PAY
+                    and cizgi_ici_mi
                     and 0 <= ayak_y < FRAME_H
+                    and 0 <= ayak_x < FRAME_W
                 )
 
+                if kare_sayac_simdi % 15 == 0:
+                    print(
+                        f"[DEBUG] ID={track_id} kutu_h={kutu_h} "
+                        f"(esik={MIN_SAYIM_KUTU_YUKSEKLIGI}) "
+                        f"cizgi_ici_mi={cizgi_ici_mi} guvenilir={guvenilir} "
+                        f"ayak=({ayak_x},{ayak_y})"
+                    )
+
                 if guvenilir:
-                    anlik_konum = ayak_konumundan_bolge_bul(ayak_y)
+                    anlik_konum = nokta_taraf_bul(ayak_x, ayak_y, params)
                     onceki_durum = durumlar.get(track_id)
 
                     if onceki_durum is None:
                         if anlik_konum is not None:
                             durumlar[track_id] = anlik_konum
+                            print(f"[DEBUG-BASLANGIC] ID={track_id} ilk_taraf={anlik_konum}")
                     elif anlik_konum is not None and anlik_konum != onceki_durum:
                         aday = gecis_adaylari.get(track_id)
                         if aday is not None and aday["yon"] == anlik_konum:
@@ -419,11 +468,16 @@ def kareyi_isle(frame):
                             aday = {"yon": anlik_konum, "sayac": 1}
                         gecis_adaylari[track_id] = aday
 
+                        print(f"[DEBUG-GECIS] ID={track_id} onceki={onceki_durum} yeni={anlik_konum} aday_sayac={aday['sayac']}/{GECIS_ONAY_KARESI}")
+
                         if aday["sayac"] >= GECIS_ONAY_KARESI:
                             yeni_durum = anlik_konum
-                            if onceki_durum == "yukari" and yeni_durum == "asagi":
+                            # A -> B : Giris, B -> A : Cikis
+                            # (yön ters gelirse admin panelinde iki noktayı
+                            # ters sırayla yeniden çizmeniz yeterli)
+                            if onceki_durum == "A" and yeni_durum == "B":
                                 gecisi_kaydet(track_id, "Giris", kisi_boyu_m)
-                            elif onceki_durum == "asagi" and yeni_durum == "yukari":
+                            elif onceki_durum == "B" and yeni_durum == "A":
                                 gecisi_kaydet(track_id, "Cikis", kisi_boyu_m)
 
                             durumlar[track_id] = yeni_durum
@@ -438,7 +492,7 @@ def kareyi_isle(frame):
                 if kisi_boyu_m is not None:
                     etiket += f" | {kisi_boyu_m:.2f}m"
 
-                cv2.putText(annotated_frame, etiket, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 0), 2)
+                cv2.putText(annotated_frame, etiket, (bx1, max(20, by1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 0), 2)
 
         with son_kutu_kilidi:
             son_kutu_yukseklikleri.clear()
@@ -482,9 +536,6 @@ def process_frame():
         jpg_as_text = base64.b64encode(buffer).decode("utf-8")
         sonuc_data_url = f"data:image/jpeg;base64,{jpg_as_text}"
 
-        # İşlenen bu kareyi "canlı yayın" olarak sunucuda sakla, böylece
-        # "Sunucuya Bağlan" ile bağlanan diğer cihazlar (kendi kameralarını
-        # açmadan) bu kareyi çekip görebilir.
         with yayin_kilidi:
             son_yayin_karesi = sonuc_data_url
             son_yayin_zamani = time.time()
@@ -496,11 +547,6 @@ def process_frame():
 
 @app.route("/son_kare")
 def son_kare():
-    """
-    Kamera göndermeyen, sadece izleyen cihazlar (örn. telefon) bu
-    endpoint'i periyodik olarak çağırarak sunucudaki en son işlenmiş
-    kareyi alır. Kendi kamerasını açmaz.
-    """
     with yayin_kilidi:
         kare = son_yayin_karesi
         zaman = son_yayin_zamani
@@ -510,6 +556,85 @@ def son_kare():
 
     yayin_aktif = (time.time() - zaman) <= YAYIN_ZAMAN_ASIMI
     return jsonify({"yayin_var": yayin_aktif, "image": kare})
+
+
+@app.route("/cizgi_durumu")
+def cizgi_durumu():
+    with cizgi_kilidi:
+        return jsonify({
+            "p1": cizgi_p1,
+            "p2": cizgi_p2,
+            "genislik": FRAME_W,
+            "yukseklik": FRAME_H,
+        })
+
+
+def cizgiyi_kareye_uzat(x1, y1, x2, y2):
+    """Verilen iki noktadan geçen çizgiyi, aynı açıyı/konumu koruyarak
+    kare (FRAME_W x FRAME_H) sınırlarına kadar uzatır. Böylece admin
+    panelinde kısa bir çizgi çizilse bile, gerçek geçiş alanının tamamı
+    kapsanmış olur ve ölü alan her zaman kameranın gerçek kenarlarında
+    oluşur."""
+    dx, dy = x2 - x1, y2 - y1
+    uzunluk = (dx ** 2 + dy ** 2) ** 0.5
+    if uzunluk < 1e-6:
+        return x1, y1, x2, y2
+
+    ux, uy = dx / uzunluk, dy / uzunluk
+
+    t_min, t_max = -1e9, 1e9
+
+    if abs(ux) > 1e-9:
+        ta, tb = (0 - x1) / ux, (FRAME_W - x1) / ux
+        t_min = max(t_min, min(ta, tb))
+        t_max = min(t_max, max(ta, tb))
+
+    if abs(uy) > 1e-9:
+        ta, tb = (0 - y1) / uy, (FRAME_H - y1) / uy
+        t_min = max(t_min, min(ta, tb))
+        t_max = min(t_max, max(ta, tb))
+
+    if t_min > t_max:
+        return x1, y1, x2, y2  # kare ile kesişim yok, olduğu gibi bırak
+
+    yeni_x1 = x1 + t_min * ux
+    yeni_y1 = y1 + t_min * uy
+    yeni_x2 = x1 + t_max * ux
+    yeni_y2 = y1 + t_max * uy
+
+    return yeni_x1, yeni_y1, yeni_x2, yeni_y2
+
+
+@app.route("/cizgi_guncelle", methods=["POST"])
+def cizgi_guncelle():
+    global cizgi_p1, cizgi_p2
+    try:
+        veri = request.json
+        ham_x1 = float(veri["x1"])
+        ham_y1 = float(veri["y1"])
+        ham_x2 = float(veri["x2"])
+        ham_y2 = float(veri["y2"])
+
+        if ((ham_x2 - ham_x1) ** 2 + (ham_y2 - ham_y1) ** 2) ** 0.5 < 10:
+            return jsonify({"durum": "hata", "mesaj": "Çizgi çok kısa"}), 400
+
+        # Çizilen açı/konum korunarak kare sınırlarına kadar uzat
+        x1, y1, x2, y2 = cizgiyi_kareye_uzat(ham_x1, ham_y1, ham_x2, ham_y2)
+
+        with cizgi_kilidi:
+            cizgi_p1 = [x1, y1]
+            cizgi_p2 = [x2, y2]
+
+        # Eski çizgiye göre oluşmuş taraf/geçiş durumlarını sıfırla,
+        # yeni çizgiyle tutarsız kalmasınlar.
+        durumlar.clear()
+        gecis_adaylari.clear()
+
+        print(f"[BILGI] Çizgi güncellendi: ({x1:.0f},{y1:.0f}) -> ({x2:.0f},{y2:.0f})")
+
+        return jsonify({"durum": "ok", "p1": cizgi_p1, "p2": cizgi_p2})
+    except Exception as e:
+        return jsonify({"durum": "hata", "mesaj": str(e)}), 400
 
 
 @app.route("/kalibrasyon_durumu")
@@ -546,6 +671,7 @@ def anasayfa():
             .info { margin-top: 15px; font-size: 14px; color: #ccc; }
             #kalibrasyonDurumu, #yayinDurumu { margin-top: 8px; font-size: 14px; color: #aaa; }
             .buton-grubu { display: flex; justify-content: center; flex-wrap: wrap; }
+            a.admin-link { display:inline-block; margin-top:20px; color:#888; font-size:13px; text-decoration:underline; }
         </style>
     </head>
     <body>
@@ -577,6 +703,8 @@ def anasayfa():
                <b>Sunucuya Bağlan:</b> kamera açmaz, sadece o an sunucuya gönderilen (başka bir cihazın yayınladığı) işlenmiş görüntüyü izler.</p>
         </div>
 
+        <a class="admin-link" href="/admin">Admin Panel (Giriş Çizgisini Ayarla)</a>
+
         <script>
             const video = document.getElementById('video');
             const canvas = document.getElementById('canvas');
@@ -588,7 +716,7 @@ def anasayfa():
 
             let kameraAktif = false;
             let izlemeAktif = false;
-            let aktifMod = null; // 'kamera' | 'izle' | null
+            let aktifMod = null;
 
             function modlariSifirla() {
                 kameraAktif = false;
@@ -597,7 +725,6 @@ def anasayfa():
                 btnIzle.disabled = false;
             }
 
-            // ---- MOD 1: Bu aygıtın kamerasını kullan (yayıncı) ----
             async function buAygitinKamerasiniKullan() {
                 if (aktifMod === 'kamera') return;
                 modlariSifirla();
@@ -645,7 +772,6 @@ def anasayfa():
                 setTimeout(goruntuGonder, 120);
             }
 
-            // ---- MOD 2: Sunucuya bağlan (izleyici) ----
             function sunucuyaBagalan() {
                 if (aktifMod === 'izle') return;
                 modlariSifirla();
@@ -708,6 +834,200 @@ def anasayfa():
             setInterval(kalibrasyonDurumunuGuncelle, 2000);
             sayaclariGuncelle();
             setInterval(sayaclariGuncelle, 1000);
+        </script>
+    </body>
+    </html>
+    """
+
+
+@app.route("/admin")
+def admin_panel():
+    return """
+    <!DOCTYPE html>
+    <html lang="tr">
+    <head>
+        <meta charset="UTF-8">
+        <title>Admin Panel - Giriş Çizgisi</title>
+        <style>
+            body { background: #111; color: white; font-family: Arial; text-align: center; margin: 0; padding: 20px; }
+            h1 { color: #00ff88; font-size: 22px; }
+            .sahne { position: relative; display: inline-block; max-width: 95vw; }
+            #referansGoruntu { width: 100%; max-width: 900px; display: block; border: 3px solid #444; border-radius: 8px; background: #000; }
+            #cizimKatmani { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: crosshair; }
+            .btn { background-color: #00ff88; color: #111; padding: 10px 20px; font-size: 15px; font-weight: bold; border: none; border-radius: 5px; cursor: pointer; margin: 6px; }
+            .btn:hover { background-color: #00cc6a; }
+            .btn.temizle { background-color: #ff5555; }
+            .btn.temizle:hover { background-color: #dd3333; }
+            .info { margin-top: 12px; font-size: 14px; color: #ccc; max-width: 700px; margin-left: auto; margin-right: auto; }
+            #durumYazisi { margin-top: 10px; font-size: 14px; color: #aaa; }
+            a.geri-link { display:inline-block; margin-top:20px; color:#888; font-size:13px; text-decoration:underline; }
+        </style>
+    </head>
+    <body>
+        <h1>Giriş Çizgisi Ayarla</h1>
+        <p class="info">
+            Aşağıdaki görüntü üzerinde iki noktaya tıklayın: önce çizginin başlangıcı, sonra bitişi.
+            İki nokta seçildiğinde önizleme çizgisi görünür. "A" tarafından "B" tarafına geçiş
+            <b>Giriş</b>, tersi <b>Çıkış</b> sayılır (yön ters gelirse noktaları ters sırayla tekrar çizin).
+        </p>
+
+        <div class="sahne">
+            <img id="referansGoruntu" alt="Görüntü bekleniyor... (bir cihaz kamerasını kullanmalı)">
+            <canvas id="cizimKatmani"></canvas>
+        </div>
+
+        <div>
+            <button class="btn" onclick="cizgiyiKaydet()">Çizgiyi Kaydet</button>
+            <button class="btn temizle" onclick="secimiTemizle()">Seçimi Temizle</button>
+        </div>
+
+        <div id="durumYazisi">Mevcut çizgi yükleniyor...</div>
+
+        <a class="geri-link" href="/">← Ana sayfaya dön</a>
+
+        <script>
+            const img = document.getElementById('referansGoruntu');
+            const canvas = document.getElementById('cizimKatmani');
+            const ctx = canvas.getContext('2d');
+            const durumYazisi = document.getElementById('durumYazisi');
+
+            let p1 = null, p2 = null;
+            let mevcutCizgi = null;
+
+            function katmanBoyutlandir() {
+                canvas.width = img.clientWidth;
+                canvas.height = img.clientHeight;
+                cizimYap();
+            }
+            window.addEventListener('resize', katmanBoyutlandir);
+            img.addEventListener('load', katmanBoyutlandir);
+
+            function ekranKoordUretcek(px, py) {
+                // Doğal (frame) koordinatı -> ekran (canvas) koordinatına çevir
+                const olcekX = canvas.width / img.naturalWidth;
+                const olcekY = canvas.height / img.naturalHeight;
+                return [px * olcekX, py * olcekY];
+            }
+
+            function cizimYap() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Sunucudaki mevcut (kayıtlı) çizgiyi soluk çiz
+                if (mevcutCizgi) {
+                    const [ex1, ey1] = ekranKoordUretcek(mevcutCizgi.p1[0], mevcutCizgi.p1[1]);
+                    const [ex2, ey2] = ekranKoordUretcek(mevcutCizgi.p2[0], mevcutCizgi.p2[1]);
+                    ctx.strokeStyle = 'rgba(255,0,0,0.4)';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([6, 4]);
+                    ctx.beginPath();
+                    ctx.moveTo(ex1, ey1);
+                    ctx.lineTo(ex2, ey2);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+
+                // Kullanıcının şu an seçtiği yeni noktalar/çizgi
+                if (p1) {
+                    ctx.fillStyle = '#00ff88';
+                    ctx.beginPath();
+                    ctx.arc(p1.ekranX, p1.ekranY, 6, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                if (p2) {
+                    ctx.fillStyle = '#3399ff';
+                    ctx.beginPath();
+                    ctx.arc(p2.ekranX, p2.ekranY, 6, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                if (p1 && p2) {
+                    ctx.strokeStyle = '#ffff00';
+                    ctx.lineWidth = 3;
+                    ctx.beginPath();
+                    ctx.moveTo(p1.ekranX, p1.ekranY);
+                    ctx.lineTo(p2.ekranX, p2.ekranY);
+                    ctx.stroke();
+                }
+            }
+
+            canvas.addEventListener('click', (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const ekranX = e.clientX - rect.left;
+                const ekranY = e.clientY - rect.top;
+
+                const olcekX = img.naturalWidth / canvas.width;
+                const olcekY = img.naturalHeight / canvas.height;
+                const dogalX = ekranX * olcekX;
+                const dogalY = ekranY * olcekY;
+
+                if (!p1) {
+                    p1 = { ekranX, ekranY, x: dogalX, y: dogalY };
+                } else if (!p2) {
+                    p2 = { ekranX, ekranY, x: dogalX, y: dogalY };
+                } else {
+                    p1 = { ekranX, ekranY, x: dogalX, y: dogalY };
+                    p2 = null;
+                }
+                cizimYap();
+            });
+
+            function secimiTemizle() {
+                p1 = null;
+                p2 = null;
+                cizimYap();
+            }
+
+            async function cizgiyiKaydet() {
+                if (!p1 || !p2) {
+                    alert("Önce iki nokta seçmelisiniz.");
+                    return;
+                }
+                try {
+                    const r = await fetch('/cizgi_guncelle', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y })
+                    });
+                    const veri = await r.json();
+                    if (veri.durum === 'ok') {
+                        durumYazisi.textContent = "Çizgi kaydedildi.";
+                        durumYazisi.style.color = "#00ff88";
+                        mevcutCizgi = { p1: veri.p1, p2: veri.p2 };
+                        p1 = null;
+                        p2 = null;
+                        cizimYap();
+                    } else {
+                        alert("Hata: " + (veri.mesaj || "bilinmeyen hata"));
+                    }
+                } catch (err) {
+                    alert("Sunucuya ulaşılamadı: " + err);
+                }
+            }
+
+            async function referansGoruntuyuGuncelle() {
+                try {
+                    const r = await fetch('/son_kare');
+                    const veri = await r.json();
+                    if (veri.image) {
+                        img.src = veri.image;
+                    }
+                } catch (e) {}
+            }
+
+            async function mevcutCizgiyiYukle() {
+                try {
+                    const r = await fetch('/cizgi_durumu');
+                    const veri = await r.json();
+                    mevcutCizgi = { p1: veri.p1, p2: veri.p2 };
+                    durumYazisi.textContent = "Mevcut çizgi: (" + veri.p1[0].toFixed(0) + "," + veri.p1[1].toFixed(0) + ") - (" + veri.p2[0].toFixed(0) + "," + veri.p2[1].toFixed(0) + ")";
+                    durumYazisi.style.color = "#aaa";
+                    cizimYap();
+                } catch (e) {}
+            }
+
+            referansGoruntuyuGuncelle();
+            setInterval(referansGoruntuyuGuncelle, 1000);
+            mevcutCizgiyiYukle();
+            setInterval(mevcutCizgiyiYukle, 5000);
         </script>
     </body>
     </html>
