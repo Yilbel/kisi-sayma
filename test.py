@@ -34,7 +34,6 @@ FLASK_PORT = 5000
 # KENAR_PAY ise çizgi boyunca (uçlara yakın "ölü alan") olarak
 # kullanılıyor -- yani ikisi de çizgiyle birlikte hareket ediyor.
 
-HISTEREZIS_PAY = 30
 GECIS_ONAY_KARESI = 4
 MIN_SAYIM_KUTU_YUKSEKLIGI = 90
 KENAR_PAY = 15
@@ -284,16 +283,6 @@ def cizgi_parametreleri():
     return x1, y1, x2, y2, ux, uy, nx, ny, uzunluk
 
 
-def nokta_taraf_bul(px, py, params):
-    x1, y1, x2, y2, ux, uy, nx, ny, uzunluk = params
-    isaretli_mesafe = (px - x1) * nx + (py - y1) * ny
-    if isaretli_mesafe < -HISTEREZIS_PAY:
-        return "A"
-    if isaretli_mesafe > HISTEREZIS_PAY:
-        return "B"
-    return None
-
-
 def nokta_cizgi_uzerinde_mi(px, py, params):
     """Nokta, çizginin iki ucundaki 'ölü alan' payı hariç, çizginin
     kapsadığı aralık içinde mi? (Ölü alan çizgiyle birlikte hareket eder.)"""
@@ -363,8 +352,7 @@ def kareyi_isle(frame):
     annotated_frame = frame.copy()
 
     with isleme_kilidi:
-        KARE_SAYAC += 1
-        kare_sayac_simdi = KARE_SAYAC
+       
 
         params = cizgi_parametreleri()
         x1, y1, x2, y2, ux, uy, nx, ny, uzunluk = params
@@ -379,6 +367,10 @@ def kareyi_isle(frame):
         cv2.line(annotated_frame, p1a, p2a, (0, 255, 255), 1)
         cv2.line(annotated_frame, p1b, p2b, (0, 255, 255), 1)
 
+
+         KARE_SAYAC += 1
+        kare_sayac_simdi = KARE_SAYAC 
+        
         try:
             results = model.track(
                 frame, classes=[0], persist=True, tracker=BYTETRACK_CFG,
