@@ -134,9 +134,9 @@ except Exception as e:
 
 
 def yas_bandini_gruba_cevir(bant):
-    cocuk = {"0-2", "3-9"}
-    genc = {"10-19", "20-29"}
-    yetiskin = {"30-39", "40-49", "50-59", "60-69", "70+"}
+    cocuk = {"0-2", "3-12"}
+    genc = {"13-19", "20-35"}
+    yetiskin = {"36-39", "40-49", "50-59", "60-69", "70+"}
     if bant in cocuk:
         return "Cocuk"
     if bant in genc:
