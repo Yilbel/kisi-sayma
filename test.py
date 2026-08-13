@@ -134,8 +134,8 @@ except Exception as e:
 
 
 def yas_bandini_gruba_cevir(bant):
-    cocuk = {"0-2", "3-12"}
-    genc = {"13-19", "20-35"}
+    cocuk = {"0-2", "3-9"}
+    genc = {"9-19", "20-36"}
     yetiskin = {"36-39", "40-49", "50-59", "60-69", "70+"}
     if bant in cocuk:
         return "Cocuk"
@@ -331,13 +331,14 @@ def kareyi_isle(frame):
     annotated_frame = frame.copy()
 
     with isleme_kilidi:
-       
+
+         KARE_SAYAC += 1
+        kare_sayac_simdi = KARE_SAYAC
+
         cv2.line(annotated_frame, (0, CIZGI_Y), (FRAME_W, CIZGI_Y), (0, 0, 255), 3)
         cv2.line(annotated_frame, (0, CIZGI_Y - HISTEREZIS_PAY), (FRAME_W, CIZGI_Y - HISTEREZIS_PAY), (0, 255, 255), 1)
         cv2.line(annotated_frame, (0, CIZGI_Y + HISTEREZIS_PAY), (FRAME_W, CIZGI_Y + HISTEREZIS_PAY), (0, 255, 255), 1)
-        
-        KARE_SAYAC += 1
-        kare_sayac_simdi = KARE_SAYAC
+    
         
         try:
             results = model.track(
