@@ -1,122 +1,108 @@
 import os
 import time
+import threading
+from datetime import datetime, timedelta
+
 import cv2
 import numpy as np
-from datetime import datetime, timedelta
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from flask import Flask, Response
 from ultralytics import YOLO
 from PIL import Image
 from transformers import pipeline
-import threading
-import matplotlib
-matplotlib.use("Agg")  # ekransiz grafik uretimi icin
-import matplotlib.pyplot as plt
 
-# ==========================================================
-# TABLET VE DROIDCAM AYARLARI
-# ==========================================================
-TABLET_IP = "192.168.1.104"
-PORT = "4747"
-DROIDCAM_URL = f"http://{TABLET_IP}:{PORT}/video"
-# ==========================================================
 
-# ==========================================================
-# BOY (YUKSEKLIK) KALIBRASYON AYARLARI
-# ----------------------------------------------------------
-# Farkli bir referans boyla kalibrasyon yapmak isterseniz
-# (orn. 1.55m) SADECE asagidaki satiri degistirmeniz yeterli.
-# 'c' tusuna (veya terminalde 'c' + Enter) basildiginda, o an
-# kamerada gorunen kisinin piksel boyu bu deger uzerinden
-# pixels_per_meter'e cevrilip kilitlenir.
-# ==========================================================
-KNOWN_USER_HEIGHT_M = 1.75  # <-- kalibrasyon referans boyu (metre) - TEK DEGISECEK YER
-pixels_per_meter = 100.0
-is_calibrated = False
-kalibrasyon_kilidi = threading.Lock()
-# ==========================================================
+# ============================================================
+# GENEL AYARLAR
+# ============================================================
 
-# ==========================================================
-# ORTA CIZGI - YATAY (sadece asagi <-> yukari gecisine gore sayim)
-# ==========================================================
-CIZGI_Y = 240
-FRAME_W, FRAME_H = 640, 480
-KENAR_PAY = 15              # kenara bu kadar piksel kala tespit guvenilmez sayilir
-MIN_SAYIM_KUTU_YUKSEKLIK = 80  # sayim icin kutunun en az bu yukseklikte olmasi gerekir
-# ==========================================================
+PROGRAM_ADI = "Kisi Sayma ve Boy Olcum Sistemi"
 
-# ==========================================================
-# RAPOR AYARLARI
-# ==========================================================
-RAPOR_KLASORU = "raporlar"
-# ==========================================================
+FRAME_W = 640
+FRAME_H = 480
 
-print(f"\n---> Tablet kamerasina baglaniliyor: {DROIDCAM_URL}")
-print("---> Lutfen bekleyin...\n")
+DROIDCAM_IP = "172.20.10.2"
+DROIDCAM_PORT = "4747"
 
-# ---- YUZ TESPITI (OpenCV Haar Cascade) ----
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+DROIDCAM_URL = (
+    f"http://{DROIDCAM_IP}:{DROIDCAM_PORT}/video"
 )
 
-# ---- YAS VE CINSIYET MODELLERI (Apache 2.0 - ticari kullanima uygun) ----
-print("[BILGI] Yas/cinsiyet modelleri yukleniyor (ilk calistirmada indirilecek)...")
-age_pipe = pipeline("image-classification", model="dima806/fairface_age_image_detection")
-gender_pipe = pipeline("image-classification", model="dima806/fairface_gender_image_detection")
-print("[BILGI] Modeller yuklendi.\n")
+WEBCAM_INDEX = 0
+
+FLASK_HOST = "0.0.0.0"
+FLASK_PORT = 5000
 
 
-def yas_bandini_gruba_cevir(bant: str) -> str:
-    cocuk = {"0-2", "3-9"}
-    genc = {"10-19", "20-29"}
-    yetiskin = {"30-39", "40-49", "50-59", "60-69", "70+"}
-    if bant in cocuk:
-        return "Cocuk"
-    elif bant in genc:
-        return "Genc"
-    elif bant in yetiskin:
-        return "Yetiskin"
-    return "Bilinmiyor"
+# ============================================================
+# KAPI / ÇİZGİ SAYIM AYARLARI
+# ============================================================
+
+CIZGI_Y = 420
+HISTEREZIS_PAY = 20
+GECIS_ONAY_KARESI = 4
+MIN_SAYIM_KUTU_YUKSEKLIGI = 60
+KENAR_PAY = 10
+TRACK_KAYIP_SURESI = 45
 
 
-def cinsiyet_cevir(label: str) -> str:
-    label = label.lower()
-    if "female" in label or "kadin" in label:
-        return "Kadin"
-    if "male" in label or "erkek" in label:
-        return "Erkek"
-    return "Bilinmiyor"
+# ============================================================
+# BOY KALİBRASYONU
+# ============================================================
+
+# Kamera karşısındaki referans kişinin gerçek boyu (metre).
+KNOWN_USER_HEIGHT_M = 1.75
+
+pixels_per_meter = 100.0
+is_calibrated = False
+
+kalibrasyon_kilidi = threading.Lock()
 
 
-# ---- YOLO MODELI (kisi tespiti/takibi) ----
-MODEL_PATH = "yolov8n.pt"
-if not os.path.isfile(MODEL_PATH):
-    print(f"[BILGI] {MODEL_PATH} bulunmuyor. Uzak model indiriliyor...")
-    model = YOLO("yolov8n")
-else:
-    try:
-        model = YOLO(MODEL_PATH)
-    except Exception as e:
-        print(f"[BILGI] {MODEL_PATH} yuklenemedi: {e}. Uzak model indiriliyor...")
-        model = YOLO("yolov8n")
+# ============================================================
+# RAPOR
+# ============================================================
 
-# DroidCam baglantisi
-cap = cv2.VideoCapture(DROIDCAM_URL)
-if not cap.isOpened():
-    print("[HATA] Tablete baglanilamadi! Bilgisayar kamerasina geciliyor...")
-    cap = cv2.VideoCapture(0)
+RAPOR_KLASORU = "raporlar"
+
+
+# ============================================================
+# BYTE TRACK AYARI
+# ============================================================
+
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+BYTETRACK_CFG = os.path.join(
+    BASE_DIR,
+    "bytetrack_custom.yaml"
+)
+
+
+# ============================================================
+# GLOBAL DURUMLAR
+# ============================================================
+
+program_calisiyor = True
 
 giris_sayisi = 0
 cikis_sayisi = 0
-durumlar = {}  # track_id -> "yukari" | "asagi"  (sadece guvenilir kutularla guncellenir)
 
-# ---- YAS/CINSIYET TESPIT AYARLARI ----
-kisi_bilgisi = {}       # track_id -> {"yas_grubu": ..., "cinsiyet": ...}
-deneme_sayisi = {}
-MAX_DENEME = 10
 KARE_SAYAC = 0
-TAHMIN_HER_N_KAREDE_BIR = 3
+
+durumlar = {}
+gecis_adaylari = {}
+kisi_bilgisi = {}
+deneme_sayisi = {}
+
+MAX_DENEME = 10
+TAHMIN_HER_N_KAREDE_BIR = 5
 MIN_KUTU_BOYUTU = 60
-MIN_YUZ_BOYUTU = 40   # bulunan yuz kirpmasi bu boyuttan kucukse guvenilmez sayilir
 
 gecis_kayitlari = []
 gecis_kilidi = threading.Lock()
@@ -124,424 +110,458 @@ gecis_kilidi = threading.Lock()
 son_frame = None
 frame_kilidi = threading.Lock()
 
-# En son gorulen kutu yukseklikleri ('c' ile kalibrasyon bunu kullanir): track_id -> piksel yukseklik
 son_kutu_yukseklikleri = {}
 son_kutu_kilidi = threading.Lock()
 
+track_son_gorulme = {}
 
-def yuz_bul(kirpilmis_govde):
-    """Govde/kafa kirpmasi icinde Haar Cascade ile gercek yuzu bulur."""
-    if kirpilmis_govde.size == 0:
+
+# ============================================================
+# YAŞ / CİNSİYET MODELLERİ
+# ============================================================
+
+print()
+print("=" * 60)
+print("YAŞ / CİNSİYET MODELLERİ YÜKLENİYOR")
+print("=" * 60)
+
+try:
+    age_pipe = pipeline(
+        "image-classification",
+        model="dima806/fairface_age_image_detection"
+    )
+
+    gender_pipe = pipeline(
+        "image-classification",
+        model="dima806/fairface_gender_image_detection"
+    )
+
+    YAS_CINSIYET_AKTIF = True
+    print("[OK] Yaş ve cinsiyet modelleri yüklendi.")
+
+except Exception as e:
+    print("[UYARI] Yaş/cinsiyet modelleri yüklenemedi:", e)
+    age_pipe = None
+    gender_pipe = None
+    YAS_CINSIYET_AKTIF = False
+
+
+def yas_bandini_gruba_cevir(bant):
+    cocuk = {"0-2", "3-9"}
+    genc = {"10-19", "20-29"}
+    yetiskin = {"30-39", "40-49", "50-59", "60-69", "70+"}
+
+    if bant in cocuk:
+        return "Cocuk"
+    if bant in genc:
+        return "Genc"
+    if bant in yetiskin:
+        return "Yetiskin"
+    return "Bilinmiyor"
+
+
+def cinsiyet_cevir(label):
+    label = str(label).lower()
+    if "female" in label or "kadin" in label:
+        return "Kadin"
+    if "male" in label or "erkek" in label:
+        return "Erkek"
+    return "Bilinmiyor"
+
+
+# ============================================================
+# YOLO MODELİ
+# ============================================================
+
+MODEL_PATH = os.path.join(BASE_DIR, "yolov8n.pt")
+
+try:
+    if os.path.isfile(MODEL_PATH):
+        model = YOLO(MODEL_PATH)
+    else:
+        model = YOLO("yolov8n.pt")
+    print("[OK] YOLO modeli hazır.")
+except Exception as e:
+    print("[HATA] YOLO modeli yüklenemedi:", e)
+    raise
+
+
+if not os.path.isfile(BYTETRACK_CFG):
+    BYTETRACK_CFG = "bytetrack.yaml"
+
+
+# ============================================================
+# KAMERA
+# ============================================================
+
+cap = cv2.VideoCapture(DROIDCAM_URL)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(WEBCAM_INDEX)
+
+if not cap.isOpened():
+    raise RuntimeError("Hiçbir kamera açılamadı!")
+
+print("[OK] Kamera bağlantısı başarılı.")
+
+
+# ============================================================
+# YÜZ / KIRPMA & TAHMİN
+# ============================================================
+
+def yuz_bul(kutu_goruntu):
+    if kutu_goruntu is None or kutu_goruntu.size == 0:
         return None
-    gri = cv2.cvtColor(kirpilmis_govde, cv2.COLOR_BGR2GRAY)
-    yuzler = face_cascade.detectMultiScale(gri, scaleFactor=1.1, minNeighbors=5,
-                                            minSize=(MIN_YUZ_BOYUTU, MIN_YUZ_BOYUTU))
-    if len(yuzler) == 0:
+    h, w = kutu_goruntu.shape[:2]
+    if h < 40 or w < 40:
         return None
-    fx, fy, fw, fh = max(yuzler, key=lambda r: r[2] * r[3])
-    return kirpilmis_govde[fy:fy + fh, fx:fx + fw]
+    return kutu_goruntu
 
 
-def yas_cinsiyet_tahmin_et(frame, box, track_id=None):
-    x1, y1, x2, y2 = [max(0, int(v)) for v in box]
-    yukseklik = y2 - y1
-    ust_y2 = y1 + int(yukseklik * 0.55)
-    kirpilmis_govde = frame[y1:ust_y2, x1:x2]
-
-    yuz = yuz_bul(kirpilmis_govde)
-    if yuz is None or yuz.size == 0:
+def yas_cinsiyet_tahmin_et(frame, box, track_id):
+    if not YAS_CINSIYET_AKTIF:
         return None, None
 
     try:
-        rgb_yuz = cv2.cvtColor(yuz, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb_yuz)
-        age_sonuc = age_pipe(pil_img)[0]
-        gender_sonuc = gender_pipe(pil_img)[0]
-        yas_grubu = yas_bandini_gruba_cevir(age_sonuc["label"])
-        cinsiyet = cinsiyet_cevir(gender_sonuc["label"])
-        print(f"[LOG] ID {track_id} -> Yas bandi: {age_sonuc['label']} "
-              f"({yas_grubu}) | Cinsiyet: {cinsiyet}")
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None, None
+
+        yukseklik = y2 - y1
+        ust_y2 = y1 + int(yukseklik * 0.55)
+        kirpinti = frame[y1:ust_y2, x1:x2]
+        yuz = yuz_bul(kirpinti)
+
+        if yuz is None:
+            return None, None
+
+        rgb = cv2.cvtColor(yuz, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+
+        age_result = age_pipe(pil_img)[0]
+        gender_result = gender_pipe(pil_img)[0]
+
+        yas_grubu = yas_bandini_gruba_cevir(age_result["label"])
+        cinsiyet = cinsiyet_cevir(gender_result["label"])
+
         return yas_grubu, cinsiyet
-    except Exception as e:
-        print(f"[TAHMIN HATASI - ID {track_id}]: {e}")
+    except Exception:
         return None, None
 
 
+# ============================================================
+# KALİBRASYON FONKSİYONU
+# ============================================================
+
 def kalibrasyonu_uygula():
-    """
-    'c' tusuna (pencere odaktayken) veya terminalde 'c'+Enter yazildiginda cagrilir.
-    Su an kamerada gorunen en yuksek (piksel olarak en buyuk) kutuyu referans alip,
-    KNOWN_USER_HEIGHT_M degerine gore pixels_per_meter'i kilitler.
-    """
     global pixels_per_meter, is_calibrated
+
     with son_kutu_kilidi:
         if not son_kutu_yukseklikleri:
-            print("[UYARI] Kalibrasyon icin kameranin onunde gorunur bir kisi olmali!")
+            print("[UYARI] Kalibrasyon için ekranda kimse görünmüyor!")
             return
-        track_id, yukseklik_px = max(son_kutu_yukseklikleri.items(), key=lambda kv: kv[1])
+        track_id, yukseklik_px = max(
+            son_kutu_yukseklikleri.items(), key=lambda item: item[1]
+        )
+
+    if yukseklik_px <= 0:
+        return
+
+    yeni_px_meter = yukseklik_px / KNOWN_USER_HEIGHT_M
 
     with kalibrasyon_kilidi:
-        pixels_per_meter = yukseklik_px / KNOWN_USER_HEIGHT_M
+        pixels_per_meter = yeni_px_meter
         is_calibrated = True
 
-    print(f"[BASARILI] Kalibrasyon tamamlandi! ID {track_id} referans alindi "
-          f"(referans boy: {KNOWN_USER_HEIGHT_M} m), "
-          f"1 metre = {pixels_per_meter:.2f} piksel olarak kilitlendi.")
+    print("\n" + "=" * 60)
+    print("KALİBRASYON TAMAMLANDI")
+    print(f"Referans Kutu Yüksekliği : {yukseklik_px} px")
+    print(f"Gerçek Boy               : {KNOWN_USER_HEIGHT_M:.2f} m")
+    print(f"Hesaplanan Piksel/Metre  : {pixels_per_meter:.2f}")
+    print("=" * 60 + "\n")
 
 
 def klavye_dinleyici():
-    """
-    Terminalden 'c' yazip Enter'a basarak da kalibrasyon tetiklenebilir.
-    Onizleme penceresi odakta olmasa/gorunmese bile kalibrasyonun
-    calismasini garanti eder.
-    """
-    print("[BILGI] Kalibrasyon icin: onizleme penceresi acikken 'c' tusuna basin, "
-          "YA DA bu terminale 'c' yazip Enter'a basin.")
-    while True:
+    global program_calisiyor
+    while program_calisiyor:
         try:
-            girdi = input()
+            girdi = input().strip().lower()
+            if girdi == "c":
+                kalibrasyonu_uygula()
+            elif girdi == "q":
+                program_calisiyor = False
+                break
         except EOFError:
             break
-        if girdi.strip().lower() == 'c':
-            kalibrasyonu_uygula()
 
 
-# ==========================================================
-# AYLIK RAPOR OLUSTURMA (sadece dosyaya - ekrana YAZILMAZ)
-# ==========================================================
-def aylik_rapor_olustur(yil=None, ay=None):
-    """
-    Verilen yil/ay icin (varsayilan: bu ay) aylik rapor dosyalarini olusturur:
-      - aylik_rapor_YYYY_MM.txt  (saatlik yas/cinsiyet dagilimi, yuzdeler, en yogun saatler)
-      - aylik_rapor_YYYY_MM.png  (ayni verinin grafikleri)
-    Sadece 'Giris' kayitlarini temel alir.
-    """
-    simdi = datetime.now()
-    hedef_yil = yil or simdi.year
-    hedef_ay = ay or simdi.month
+# ============================================================
+# YÖN VE GEÇİŞ İŞLEMLERİ
+# ============================================================
 
-    with gecis_kilidi:
-        kayit_kopyasi = list(gecis_kayitlari)
+def ayak_konumundan_bolge_bul(ayak_y):
+    ust_sinir = CIZGI_Y - HISTEREZIS_PAY
+    alt_sinir = CIZGI_Y + HISTEREZIS_PAY
 
-    giris_kayitlari = []
-    for k in kayit_kopyasi:
-        zaman = datetime.strptime(k["zaman"], "%Y-%m-%d %H:%M:%S")
-        if k["tip"] == "Giris" and zaman.year == hedef_yil and zaman.month == hedef_ay:
-            giris_kayitlari.append((zaman, k))
+    if ayak_y < ust_sinir:
+        return "yukari"
+    if ayak_y > alt_sinir:
+        return "asagi"
+    return None
 
-    if not giris_kayitlari:
-        print(f"[RAPOR] {hedef_yil}-{hedef_ay:02d} icin kayit yok, rapor olusturulmadi.")
+
+def gecisi_kaydet(track_id, yon, boy_m):
+    global giris_sayisi, cikis_sayisi
+
+    bilgi = kisi_bilgisi.get(
+        track_id, {"yas_grubu": "Bilinmiyor", "cinsiyet": "Bilinmiyor"}
+    )
+
+    kayit = {
+        "zaman": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "yas_grubu": bilgi.get("yas_grubu", "Bilinmiyor"),
+        "cinsiyet": bilgi.get("cinsiyet", "Bilinmiyor"),
+        "boy_m": round(boy_m, 2) if boy_m is not None else None,
+    }
+
+    if yon == "Giris":
+        giris_sayisi += 1
+        kayit["tip"] = "Giris"
+        print(f"\n******** GİRİŞ #{giris_sayisi} ********")
+    elif yon == "Cikis":
+        cikis_sayisi += 1
+        kayit["tip"] = "Cikis"
+        print(f"\n******** ÇIKIŞ #{cikis_sayisi} ********")
+    else:
         return
 
-    toplam = len(giris_kayitlari)
-    saat_yas = {}
-    saat_cinsiyet = {}
-    cinsiyet_toplam = {}
-    saat_toplam = {}
+    print(f"ID        : {track_id}")
+    print(f"Yaş grubu : {kayit['yas_grubu']}")
+    print(f"Cinsiyet  : {kayit['cinsiyet']}")
+    print(f"Boy       : {kayit['boy_m']} m")
+    print("*******************************")
 
-    for zaman, k in giris_kayitlari:
-        saat = zaman.hour
-        yg = k["yas_grubu"]
-        cs = k["cinsiyet"]
-
-        saat_yas.setdefault(saat, {})
-        saat_yas[saat][yg] = saat_yas[saat].get(yg, 0) + 1
-
-        saat_cinsiyet.setdefault(saat, {})
-        saat_cinsiyet[saat][cs] = saat_cinsiyet[saat].get(cs, 0) + 1
-
-        cinsiyet_toplam[cs] = cinsiyet_toplam.get(cs, 0) + 1
-        saat_toplam[saat] = saat_toplam.get(saat, 0) + 1
-
-    # ---- METIN RAPORU ----
-    satirlar = []
-    satirlar.append(f"===== AYLIK RAPOR: {hedef_yil}-{hedef_ay:02d} =====")
-    satirlar.append(f"Toplam Giris Sayisi: {toplam}\n")
-
-    satirlar.append("---- SAATLERE GORE YAS GRUBU DAGILIMI ----")
-    for saat in sorted(saat_yas.keys()):
-        detay = ", ".join(f"{yg}: {sayi}" for yg, sayi in sorted(saat_yas[saat].items()))
-        satirlar.append(f"{saat:02d}:00 -> {detay}")
-
-    satirlar.append("\n---- SAATLERE GORE CINSIYET DAGILIMI ----")
-    for saat in sorted(saat_cinsiyet.keys()):
-        detay = ", ".join(f"{cs}: {sayi}" for cs, sayi in sorted(saat_cinsiyet[saat].items()))
-        satirlar.append(f"{saat:02d}:00 -> {detay}")
-
-    satirlar.append("\n---- AYLIK CINSIYET YUZDELERI ----")
-    for cs, sayi in sorted(cinsiyet_toplam.items(), key=lambda kv: kv[1], reverse=True):
-        yuzde = (sayi / toplam) * 100
-        satirlar.append(f"{cs}: %{yuzde:.1f} ({sayi} kisi)")
-
-    satirlar.append("\n---- EN YOGUN SAATLER (YUZDE) ----")
-    for saat, sayi in sorted(saat_toplam.items(), key=lambda kv: kv[1], reverse=True):
-        yuzde = (sayi / toplam) * 100
-        satirlar.append(f"{saat:02d}:00 -> %{yuzde:.1f} ({sayi} kisi)")
-
-    os.makedirs(RAPOR_KLASORU, exist_ok=True)
-    txt_yolu = os.path.join(RAPOR_KLASORU, f"aylik_rapor_{hedef_yil}_{hedef_ay:02d}.txt")
-    with open(txt_yolu, "w", encoding="utf-8") as f:
-        f.write("\n".join(satirlar))
-
-    # ---- GRAFIKLER ----
-    try:
-        tum_saatler = list(range(24))
-        tum_yas_gruplari = sorted({yg for d in saat_yas.values() for yg in d.keys()})
-        tum_cinsiyetler = sorted({cs for d in saat_cinsiyet.values() for cs in d.keys()})
-
-        fig, eksenler = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(f"Aylik Rapor: {hedef_yil}-{hedef_ay:02d}  (Toplam Giris: {toplam})", fontsize=14)
-
-        ax = eksenler[0][0]
-        alt_taban = np.zeros(len(tum_saatler))
-        for yg in tum_yas_gruplari:
-            degerler = np.array([saat_yas.get(s, {}).get(yg, 0) for s in tum_saatler])
-            ax.bar(tum_saatler, degerler, bottom=alt_taban, label=yg)
-            alt_taban += degerler
-        ax.set_title("Saatlere Gore Yas Grubu")
-        ax.set_xlabel("Saat")
-        ax.set_ylabel("Kisi Sayisi")
-        ax.legend()
-
-        ax = eksenler[0][1]
-        alt_taban = np.zeros(len(tum_saatler))
-        for cs in tum_cinsiyetler:
-            degerler = np.array([saat_cinsiyet.get(s, {}).get(cs, 0) for s in tum_saatler])
-            ax.bar(tum_saatler, degerler, bottom=alt_taban, label=cs)
-            alt_taban += degerler
-        ax.set_title("Saatlere Gore Cinsiyet")
-        ax.set_xlabel("Saat")
-        ax.set_ylabel("Kisi Sayisi")
-        ax.legend()
-
-        ax = eksenler[1][0]
-        etiketler = list(cinsiyet_toplam.keys())
-        degerler = list(cinsiyet_toplam.values())
-        ax.pie(degerler, labels=etiketler, autopct="%1.1f%%")
-        ax.set_title("Aylik Cinsiyet Yuzdesi")
-
-        ax = eksenler[1][1]
-        saat_sirali = sorted(saat_toplam.items(), key=lambda kv: kv[0])
-        saatler_x = [s for s, _ in saat_sirali]
-        yuzdeler_y = [(sayi / toplam) * 100 for _, sayi in saat_sirali]
-        ax.bar(saatler_x, yuzdeler_y, color="orange")
-        ax.set_title("Saatlik Yogunluk (%)")
-        ax.set_xlabel("Saat")
-        ax.set_ylabel("Yuzde (%)")
-
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-        png_yolu = os.path.join(RAPOR_KLASORU, f"aylik_rapor_{hedef_yil}_{hedef_ay:02d}.png")
-        plt.savefig(png_yolu)
-        plt.close(fig)
-    except Exception as e:
-        print(f"[RAPOR] Grafik olusturulamadi: {e}")
-        png_yolu = None
-
-    print(f"[RAPOR] Kaydedildi: {txt_yolu}" + (f" ve {png_yolu}" if png_yolu else ""))
+    with gecis_kilidi:
+        gecis_kayitlari.append(kayit)
 
 
-def aylik_rapor_zamanlayici():
-    """Her saat kontrol eder; ay degisince bir onceki ayin raporunu otomatik dosyaya yazar."""
-    son_kontrol_ay = datetime.now().month
-    while True:
-        time.sleep(3600)
-        simdi = datetime.now()
-        if simdi.month != son_kontrol_ay:
-            onceki_ay_tarih = simdi.replace(day=1) - timedelta(days=1)
-            aylik_rapor_olustur(onceki_ay_tarih.year, onceki_ay_tarih.month)
-            son_kontrol_ay = simdi.month
+def eski_trackleri_temizle():
+    simdi = time.time()
+    silinecekler = [
+        tid
+        for tid, zmn in track_son_gorulme.items()
+        if simdi - zmn > TRACK_KAYIP_SURESI
+    ]
+    for tid in silinecekler:
+        track_son_gorulme.pop(tid, None)
+        durumlar.pop(tid, None)
+        gecis_adaylari.pop(tid, None)
+        kisi_bilgisi.pop(tid, None)
+        deneme_sayisi.pop(tid, None)
 
+
+# ============================================================
+# KAMERA DÖNGÜSÜ
+# ============================================================
 
 def kamera_dongusu():
-    global giris_sayisi, cikis_sayisi, KARE_SAYAC, son_frame
+    global program_calisiyor, KARE_SAYAC, son_frame
 
-    while True:
+    while program_calisiyor:
         ret, frame = cap.read()
         if not ret:
-            print("Goruntu alinamadi. Program kapaniyor...")
             break
 
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         KARE_SAYAC += 1
 
-        results = model.track(frame, classes=[0], persist=True, verbose=False)
-        annotated_frame = results[0].plot(labels=False, conf=False)
+        try:
+            results = model.track(
+                frame,
+                classes=[0],
+                persist=True,
+                tracker=BYTETRACK_CFG,
+                verbose=False,
+                conf=0.35,
+                iou=0.5
+            )
+        except Exception:
+            continue
 
-        # ---- ORTA CIZGI: YATAY ----
-        cv2.line(annotated_frame, (0, CIZGI_Y), (annotated_frame.shape[1], CIZGI_Y), (0, 0, 255), 2)
+        result = results[0]
+        annotated_frame = frame.copy()
+
+        # Çizgileri çiz
+        cv2.line(annotated_frame, (0, CIZGI_Y), (FRAME_W, CIZGI_Y), (0, 0, 255), 3)
+        cv2.line(annotated_frame, (0, CIZGI_Y - HISTEREZIS_PAY), (FRAME_W, CIZGI_Y - HISTEREZIS_PAY), (0, 255, 255), 1)
+        cv2.line(annotated_frame, (0, CIZGI_Y + HISTEREZIS_PAY), (FRAME_W, CIZGI_Y + HISTEREZIS_PAY), (0, 255, 255), 1)
 
         guncel_yukseklikler = {}
 
-        if results[0].boxes.id is not None:
-            ids = results[0].boxes.id.int().tolist()
-            boxes = results[0].boxes.xyxy.tolist()
+        if result.boxes is not None and result.boxes.id is not None:
+            ids = result.boxes.id.int().cpu().tolist()
+            boxes = result.boxes.xyxy.cpu().tolist()
 
             for track_id, box in zip(ids, boxes):
                 x1, y1, x2, y2 = [int(v) for v in box]
-                merkez_y = int((y1 + y2) / 2)
-                kutu_yuksekligi_px = y2 - y1
-                guncel_yukseklikler[track_id] = kutu_yuksekligi_px
+                x1 = max(0, min(FRAME_W - 1, x1))
+                y1 = max(0, min(FRAME_H - 1, y1))
+                x2 = max(0, min(FRAME_W - 1, x2))
+                y2 = max(0, min(FRAME_H - 1, y2))
 
-                # ---- YAS / CINSIYET TAHMINI ----
+                kutu_w = x2 - x1
+                kutu_h = y2 - y1
+                if kutu_w <= 0 or kutu_h <= 0:
+                    continue
+
+                track_son_gorulme[track_id] = time.time()
+                guncel_yukseklikler[track_id] = kutu_h
+
+                ayak_x = int((x1 + x2) / 2)
+                ayak_y = y2
+
+                cv2.circle(annotated_frame, (ayak_x, ayak_y), 6, (255, 0, 255), -1)
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                # Yaş / Cinsiyet Tahmini
                 if track_id not in kisi_bilgisi:
                     deneme_sayisi.setdefault(track_id, 0)
-
-                    kutu_yeterince_buyuk = (x2 - x1) >= MIN_KUTU_BOYUTU and (y2 - y1) >= MIN_KUTU_BOYUTU
-
-                    kareyi_dene_mi = (
+                    if (
                         deneme_sayisi[track_id] < MAX_DENEME
                         and KARE_SAYAC % TAHMIN_HER_N_KAREDE_BIR == 0
-                        and kutu_yeterince_buyuk
-                    )
-
-                    if kareyi_dene_mi:
-                        yas_grubu, cinsiyet = yas_cinsiyet_tahmin_et(frame, (x1, y1, x2, y2), track_id)
+                        and kutu_w >= MIN_KUTU_BOYUTU
+                        and kutu_h >= MIN_KUTU_BOYUTU
+                    ):
+                        yg, cins = yas_cinsiyet_tahmin_et(frame, (x1, y1, x2, y2), track_id)
                         deneme_sayisi[track_id] += 1
-
-                        if yas_grubu is not None and cinsiyet is not None:
-                            kisi_bilgisi[track_id] = {"yas_grubu": yas_grubu, "cinsiyet": cinsiyet}
+                        if yg and cins:
+                            kisi_bilgisi[track_id] = {"yas_grubu": yg, "cinsiyet": cins}
                         elif deneme_sayisi[track_id] >= MAX_DENEME:
                             kisi_bilgisi[track_id] = {"yas_grubu": "Bilinmiyor", "cinsiyet": "Bilinmiyor"}
 
-                # ---- BOY HESABI ----
+                # Boy Hesaplama
                 kisi_boyu_m = None
                 with kalibrasyon_kilidi:
                     if is_calibrated and pixels_per_meter > 0:
-                        kisi_boyu_m = kutu_yuksekligi_px / pixels_per_meter
+                        kisi_boyu_m = kutu_h / pixels_per_meter
 
-                # ---- GIRIS / CIKIS SAYIMI: SADECE yatay cizgi gecisi ----
-                # Kutu ekran kenarina cok yakinsa (kisi sagdan/soldan cikarken kutu
-                # kirpiliyor) veya kutu kucukse, bu kare guvenilmez sayilir ve
-                # durum/sayim GUNCELLENMEZ. Boylece kenardan cikis-giris hareketi
-                # yanlislikla yatay cizgi gecisi gibi sayilmaz.
-                guvenilir_kutu = (
-                    x1 > KENAR_PAY
-                    and x2 < (FRAME_W - KENAR_PAY)
-                    and kutu_yuksekligi_px >= MIN_SAYIM_KUTU_YUKSEKLIK
+                # Sayım Kontrolü
+                guvenilir = (
+                    kutu_h >= MIN_SAYIM_KUTU_YUKSEKLIGI
+                    and x1 > KENAR_PAY
+                    and x2 < FRAME_W - KENAR_PAY
+                    and 0 <= ayak_y < FRAME_H
                 )
 
-                if guvenilir_kutu:
-                    yeni_durum = "yukari" if merkez_y < CIZGI_Y else "asagi"
+                if guvenilir:
+                    anlik_konum = ayak_konumundan_bolge_bul(ayak_y)
                     onceki_durum = durumlar.get(track_id)
 
-                    if onceki_durum is not None and onceki_durum != yeni_durum:
-                        bilgi = kisi_bilgisi.get(track_id, {"yas_grubu": "Bilinmiyor", "cinsiyet": "Bilinmiyor"})
+                    if onceki_durum is None:
+                        if anlik_konum is not None:
+                            durumlar[track_id] = anlik_konum
+                    elif anlik_konum is not None and anlik_konum != onceki_durum:
+                        aday = gecis_adaylari.get(track_id)
+                        if aday is not None and aday["yon"] == anlik_konum:
+                            aday["sayac"] += 1
+                        else:
+                            aday = {"yon": anlik_konum, "sayac": 1}
+                        gecis_adaylari[track_id] = aday
 
-                        kayit = {
-                            "zaman": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "yas_grubu": bilgi["yas_grubu"],
-                            "cinsiyet": bilgi["cinsiyet"],
-                            "boy_m": round(kisi_boyu_m, 2) if kisi_boyu_m is not None else None,
-                        }
+                        if aday["sayac"] >= GECIS_ONAY_KARESI:
+                            yeni_durum = anlik_konum
+                            if onceki_durum == "yukari" and yeni_durum == "asagi":
+                                gecisi_kaydet(track_id, "Giris", kisi_boyu_m)
+                            elif onceki_durum == "asagi" and yeni_durum == "yukari":
+                                gecisi_kaydet(track_id, "Cikis", kisi_boyu_m)
 
-                        if onceki_durum == "yukari" and yeni_durum == "asagi":
-                            giris_sayisi += 1
-                            kayit["tip"] = "Giris"
-                            with gecis_kilidi:
-                                gecis_kayitlari.append(kayit)
-                        elif onceki_durum == "asagi" and yeni_durum == "yukari":
-                            cikis_sayisi += 1
-                            kayit["tip"] = "Cikis"
-                            with gecis_kilidi:
-                                gecis_kayitlari.append(kayit)
+                            durumlar[track_id] = yeni_durum
+                            gecis_adaylari.pop(track_id, None)
+                    else:
+                        gecis_adaylari.pop(track_id, None)
 
-                    durumlar[track_id] = yeni_durum
-                # guvenilmez kutu -> durum degistirilmez, sayim yapilmaz
-
-                # ---- ETIKET CIZIMI ----
+                # Ekran Etiketi
                 etiket = f"ID: {track_id}"
                 if track_id in kisi_bilgisi:
-                    bilgi = kisi_bilgisi[track_id]
-                    etiket += f" | {bilgi['cinsiyet']} | {bilgi['yas_grubu']}"
+                    b = kisi_bilgisi[track_id]
+                    etiket += f" | {b['cinsiyet']} | {b['yas_grubu']}"
                 if kisi_boyu_m is not None:
                     etiket += f" | {kisi_boyu_m:.2f}m"
 
-                cv2.putText(annotated_frame, etiket, (x1, max(20, y1 - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+                cv2.putText(annotated_frame, etiket, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 0), 2)
 
         with son_kutu_kilidi:
             son_kutu_yukseklikleri.clear()
             son_kutu_yukseklikleri.update(guncel_yukseklikler)
 
-        cv2.putText(annotated_frame, f"Giris: {giris_sayisi}", (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f"Cikis: {cikis_sayisi}", (20, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        if KARE_SAYAC % 30 == 0:
+            eski_trackleri_temizle()
 
-        # ---- KUCUK px/m ETIKETI ----
+        # Üst Bilgi Paneli
+        cv2.rectangle(annotated_frame, (0, 0), (640, 105), (0, 0, 0), -1)
+        cv2.putText(annotated_frame, f"GIRIS : {giris_sayisi}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, f"CIKIS : {cikis_sayisi}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2)
+
         with kalibrasyon_kilidi:
-            px_m_metni = f"{pixels_per_meter:.0f}px/m" if is_calibrated else "--px/m"
-        cv2.putText(annotated_frame, px_m_metni, (20, annotated_frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+            px_text = f"{pixels_per_meter:.0f}px/m" if is_calibrated else "--px/m"
+        cv2.putText(annotated_frame, px_text, (20, FRAME_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
         with frame_kilidi:
             son_frame = annotated_frame.copy()
 
-        # ---- YEREL ONIZLEME PENCERESI: 'c' ile kalibrasyon, 'q' ile cikis ----
         try:
-            cv2.imshow("Kisi Sayma - Kalibrasyon icin 'c' (pencere odakta olmali), cikis icin 'q'", annotated_frame)
-            tus = cv2.waitKey(1) & 0xFF
-            if tus == ord('c'):
-                kalibrasyonu_uygula()
-            elif tus == ord('q'):
+            cv2.imshow("Kisi Sayma ve Boy Olcum", annotated_frame)
+            if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                program_calisiyor = False
                 break
         except cv2.error:
-            # Ekransiz (headless) ortamda calisiyorsa pencere acilamaz;
-            # kalibrasyon bu durumda terminalden 'c' + Enter ile yapilabilir.
             pass
 
     cap.release()
     cv2.destroyAllWindows()
 
 
-# ==========================================================
-# FLASK WEB ARAYUZU (sadece izleme icin)
-# ==========================================================
+# ============================================================
+# FLASK & RAPOR (Aynı Yapı)
+# ============================================================
+
 app = Flask(__name__)
 
-
 def frame_uret():
-    while True:
+    while program_calisiyor:
         with frame_kilidi:
             if son_frame is None:
+                time.sleep(0.01)
                 continue
-            basarili, buffer = cv2.imencode('.jpg', son_frame)
-            if not basarili:
-                continue
-            frame_bytes = buffer.tobytes()
+            frame = son_frame.copy()
+        ok, buffer = cv2.imencode(".jpg", frame)
+        if not ok:
+            continue
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-
-@app.route('/video')
+@app.route("/video")
 def video():
-    return Response(frame_uret(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(frame_uret(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-
-@app.route('/')
+@app.route("/")
 def anasayfa():
     return """
-    <html>
-    <head><title>Kisi Sayma</title></head>
-    <body style="text-align:center; font-family:sans-serif;">
-        <h1>Kisi Sayma Sistemi</h1>
-        <img src="/video" width="640" height="480">
-        <p>Boy kalibrasyonu: onizleme penceresi odaktayken 'c' tusuna basin,
-           ya da programi calistirdiginiz terminale 'c' yazip Enter'a basin.</p>
-    </body>
-    </html>
+    <!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><title>Kişi Sayma ve Boy Ölçüm</title>
+    <style>body{background:#111;color:white;font-family:Arial;text-align:center;margin:0;padding:20px;}h1{color:#00ff88;}img{width:640px;max-width:95vw;border:3px solid #444;}</style></head>
+    <body><h1>Kişi Sayma ve Boy Ölçüm Sistemi</h1><img src="/video">
+    <p>Kalibrasyon için terminale <b>c + Enter</b> yazın.</p></body></html>
     """
 
+if __name__ == "__main__":
+    threading.Thread(target=kamera_dongusu, daemon=True).start()
+    threading.Thread(target=klavye_dinleyici, daemon=True).start()
 
-if __name__ == '__main__':
-    kamera_thread = threading.Thread(target=kamera_dongusu, daemon=True)
-    kamera_thread.start()
-
-    rapor_thread = threading.Thread(target=aylik_rapor_zamanlayici, daemon=True)
-    rapor_thread.start()
-
-    klavye_thread = threading.Thread(target=klavye_dinleyici, daemon=True)
-    klavye_thread.start()
-
-    app.run(host='0.0.0.0', port=5000)
+    try:
+        app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, debug=False, use_reloader=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        program_calisiyor = False
